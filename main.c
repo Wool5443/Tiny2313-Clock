@@ -19,6 +19,7 @@ typedef enum
     SET_MINS,
     SET_ALARM_HOURS,
     SET_ALARM_MINS,
+    SET_BRIGHTNESS,
     ALARM_RINGING,
 } Modes;
 
@@ -30,12 +31,12 @@ typedef enum
     BLINK_DOT,
 } BlinkMode;
 
-typedef struct EEPROMsettings
+typedef struct 
 {
     uint8_t  alarmEnabled;
-    int32_t  alarmTime;
+    Time     alarmTime;
     uint8_t  brightness;
-};
+} EEPROMsettings;
 
 static EEPROMsettings settings;
 
@@ -65,17 +66,10 @@ static const uint8_t F_LETTER = 0b10101010,
 
 static const uint8_t BUTTON_PIN = PD5;
 
-typedef enum
-{
-    PLUS  = (1 << 0),
-    SET   = (1 << 1),
-    MINUS = (1 << 2)
-} Buttons;
-
 static Time time;
 
 static void initHardware();
-void timers_init(void);
+void timersInit(void);
 
 static void drawTime(Time time, BlinkMode blink);
 
@@ -83,13 +77,45 @@ static void printOnDisplay(uint8_t segmentData);
 static void printOn();
 static void printOff();
 
+static void readButtons(Modes* mode, uint32_t currentTechTime, int32_t* time);
+
 static uint8_t drawingSegmentData[4] = {NOTHING, NOTHING, NOTHING, NOTHING};
 static uint8_t buttonsState = 0xFF;
+static uint32_t buttonOvfCounter = 0;
+
+static const uint32_t shortPressTime = 100 / F_CPU * 64;
+static const uint32_t longPressTime = 3000 / F_CPU * 64;
+
+typedef enum
+{
+    PLUS  = (1 << 0),
+    SET   = (1 << 1),
+    MINUS = (1 << 2)
+} Buttons;
+
+
+static void readButtons()
+{
+    uint8_t newButtonsState = buttonsState;
+    static uint8_t oldButtonsState = 0xFF;
+    uint8_t button = newButtonsState ^ oldButtonsState;
+
+    if (newButtonsState < oldButtonsState) // unpress button
+    {
+        if (buttonOvfCounter > longPressTime)
+            processSlowButtons(button);
+        else if (buttonOvfCounter > shortPressTime)
+            processFastButtons(button);
+    }
+
+    if (button)
+        buttonOvfCounter = 0;
+    oldButtonsState = newButtonsState;
+}
 
 int main(void)
 {
     initHardware();
-    timers_init();
 
     time.hrs = 13;
     time.mins = 30;
@@ -103,12 +129,14 @@ int main(void)
 
 static void initHardware(void)
 {
+    PORTD |= (1 << BUTTON_PIN);
     DDRB = 0xFF;
     DDRD |= ALL_SEGMENTS;
-    PORTD |= (1 << BUTTON_PIN);
+
+    timersInit();
 }
 
-void timers_init(void)
+void timersInit(void)
 {
     cli();
 
@@ -122,6 +150,7 @@ void timers_init(void)
     TIMSK  = (1 << TOIE1) | (1 << TOIE0) | (1 << OCIE0A);
 
     OCR0A = 100; // brightness
+    TCNT1 = MEGA_TIMER_PODGON;
 
     sei();
 }
@@ -163,37 +192,28 @@ ISR(TIMER1_OVF_vect)
 // Drawing time
 
 static uint8_t currentDigit = 0;
-static uint16_t buttonOvfCounter = 0;
 
 ISR(TIMER0_OVF_vect)
 {
     currentDigit = (currentDigit + 1) % 5;
+    buttonOvfCounter++;
 
     if(currentDigit == 4) // Read buttons state
     {
         PORTB = NOTHING;
         buttonsState = 0x00;
+        uint8_t lastPBState = PORTD | (SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
 
-        PORTD |= (SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
-        PORTD ^= SEGMENT_PINS[0];
+        for(int button = 0; button < 3; button++) {
+            PORTD = lastPBState & ~SEGMENT_PINS[button];
+            _delay_us(1);
+            buttonsState <<= 1;
+            buttonsState |= (~PIND & (1 << BUTTON_PIN)) >> BUTTON_PIN;
+        }
 
-        _delay_us(10);
-        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN);
-
-        PORTD ^= SEGMENT_PINS[0] | SEGMENT_PINS[1];
-        _delay_us(10);
-        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN - 1);
-
-        PORTD ^= SEGMENT_PINS[1] | SEGMENT_PINS[2];
-        _delay_us(10);
-        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN - 2);
-
-        PORTD ^= SEGMENT_PINS[2];
-
-        buttonsState ^= 0b111;
         return;
     }
-    buttonOvfCounter++;
+
 	PORTD |= SEGMENT_PINS[currentDigit];
     PORTB = drawingSegmentData[currentDigit];
 }
@@ -217,8 +237,5 @@ static void printOff()
     drawingSegmentData[1] = F_LETTER;
     drawingSegmentData[2] = F_LETTER;
     drawingSegmentData[3] = NOTHING;
-}
-
-static void allSegmentsOff() {
 }
 
