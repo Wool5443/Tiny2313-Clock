@@ -54,28 +54,41 @@ static const uint8_t F_LETTER = 0b10101010,
                      NOTHING  = 0b11111111,
                      POINT    = 0b11110111;
 
+typedef enum
+{
+    PLUS  = (1 << 0),
+    SET   = (1 << 1),
+    MINUS = (1 << 2)
+} Buttons;
+
 static Time time;
 
 static void initHardware();
-void timer1_init(void);
+void timers_init(void);
 
-static void drawTime(uint8_t currentSegmen, Time time, BlinkMode blink);
+static void drawTime(Time time, BlinkMode blink);
 
-static void printOnDisplay(uint8_t currentDigit, uint8_t segmentData);
-static void printOn(uint8_t currentDigit);
-static void printOff(uint8_t currentDigit);
+static void printOnDisplay(uint8_t segmentData);
+static void printOn();
+static void printOff();
+
+static void allSegmentsOff();
+
+static uint8_t drawingSegmentData[4] = {NOTHING, NOTHING, NOTHING, NOTHING};
 
 int main(void)
 {
     initHardware();
-    timer1_init();
+    timers_init();
 
-    uint8_t currentDigit = 0;
+    time.hrs = 13;
+    time.mins = 30;
+
     while (true)
     {
-        drawTime(currentDigit, time, NO_BLINK);
-        currentDigit = (currentDigit + 1) % 4;
-        _delay_ms(1);
+        _delay_ms(10);
+        drawTime(time, NO_BLINK);
+        OCR0A++;
     }
 }
 
@@ -85,45 +98,39 @@ static void initHardware(void)
     DDRD |= ALL_SEGMENTS;
 }
 
-void timer1_init(void)
+void timers_init(void)
 {
     cli();
 
     TCCR1A = 0x00;
-    TCCR1B = (1 << CS12) | (1 << CS10);
-    TIFR   |= 1 << TOV1;
-    TIMSK  = (1 << TOIE1);
+    TCCR1B = (1 << CS12) | (1 << CS10); // 1/1024
+
+    TCCR0A = 0x00;
+    TCCR0B = (1 << CS01) | (1 << CS00); // 1/1024
+
+    TIFR  |= (1 << TOV1)  | (1 << TOV0)  | (1 << OCF0A);
+    TIMSK  = (1 << TOIE1) | (1 << TOIE0) | (1 << OCIE0A);
+
+    OCR0A = 100; // brightness
 
     sei();
 }
 
-static void drawTime(uint8_t currentDigit, Time time, BlinkMode blink)
+static void drawTime(Time time, BlinkMode blink)
 {
-    uint8_t segmentData = NOTHING;
+    if (time.hrs >= 10)
+        drawingSegmentData[0] = DIGIT_SCHEMES[time.hrs / 10];
+    else
+        drawingSegmentData[0] = NOTHING;
 
-    switch (currentDigit)
-    {
-        case 0:
-            if (time.hrs >= 10)
-                segmentData = DIGIT_SCHEMES[time.hrs / 10];
-            break;
-        case 1:
-            segmentData = DIGIT_SCHEMES[time.hrs % 10];
-            break;
-        case 2:
-            segmentData = DIGIT_SCHEMES[time.mins / 10];
-            break;
-        case 3:
-            segmentData = DIGIT_SCHEMES[time.mins % 10];
-            break;
-    }
-
-    printOnDisplay(currentDigit, segmentData);
+    drawingSegmentData[1] = DIGIT_SCHEMES[time.hrs  % 10];
+    drawingSegmentData[2] = DIGIT_SCHEMES[time.mins / 10];
+    drawingSegmentData[3] = DIGIT_SCHEMES[time.mins % 10];
 }
 
 ISR(TIMER1_OVF_vect)
 {
-    time.secs += 60;
+    time.secs += 1;
 
     if (time.secs >= 60)
     {
@@ -143,21 +150,60 @@ ISR(TIMER1_OVF_vect)
     TCNT1 = MEGA_TIMER_PODGON;
 }
 
-static void printOnDisplay(uint8_t currentDigit, uint8_t segmentData)
+// Drawing time
+
+static uint8_t currentDigit = 0;
+static uint16_t buttonOvfCounter = 0;
+
+ISR(TIMER0_OVF_vect)
 {
+    buttonOvfCounter++;
+	PORTD |= SEGMENT_PINS[currentDigit];
+    PORTB = drawingSegmentData[currentDigit];
+}
+
+ISR(TIMER0_COMPA_vect)
+{
+    allSegmentsOff();
+    currentDigit = (currentDigit + 1) % 4;
+}
+
+static void printOn()
+{
+    drawingSegmentData[0] = DIGIT_SCHEMES[0];
+    drawingSegmentData[1] = N_LETTER;
+    drawingSegmentData[2] = NOTHING;
+    drawingSegmentData[3] = NOTHING;
+}
+
+static void printOff()
+{
+    drawingSegmentData[0] = DIGIT_SCHEMES[0];
+    drawingSegmentData[1] = F_LETTER;
+    drawingSegmentData[2] = F_LETTER;
+    drawingSegmentData[3] = NOTHING;
+}
+
+/* static uint8_t readButtons() */
+/* { */
+/*     PORTB = NOTHING; */
+
+/*     uint8_t buttons = 0; */
+/*     for(int i = 0; i < 3; i++) */
+/*     { */
+/*         PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]); */
+/*         _delay_us(10); */
+/*         PORTB = segmentData; */
+/*         PORTD |=  SEGMENT_PINS[currentDigit]; */
+/*         PORTD = SEGMENT_PINS[i]; */
+
+/*     } */
+
+/*     PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]); */
+/*     return buttons; */
+/* } */
+
+static void allSegmentsOff() {
 	PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
-	PORTB = segmentData;
-	PORTD |=  SEGMENT_PINS[currentDigit];
 }
 
-static void printOn(uint8_t currentDigit)
-{
-    uint8_t symbols[] = { DIGIT_SCHEMES[0], N_LETTER, NOTHING, NOTHING };
-    printOnDisplay(currentDigit, symbols[currentDigit]);
-}
-
-static void printOff(uint8_t currentDigit)
-{
-    uint8_t symbols[] = { DIGIT_SCHEMES[0], F_LETTER, F_LETTER, NOTHING };
-    printOnDisplay(currentDigit, symbols[currentDigit]);
-}
