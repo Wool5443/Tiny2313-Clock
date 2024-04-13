@@ -30,6 +30,15 @@ typedef enum
     BLINK_DOT,
 } BlinkMode;
 
+typedef struct EEPROMsettings
+{
+    uint8_t  alarmEnabled;
+    int32_t  alarmTime;
+    uint8_t  brightness;
+};
+
+static EEPROMsettings settings;
+
 static const uint16_t MEGA_TIMER_PODGON = 49911;
 
 static const uint8_t SEGMENT_PINS[] = { 1 << PD4, 1 << PD3, 1 << PD2, 1 << PD6 };
@@ -54,6 +63,8 @@ static const uint8_t F_LETTER = 0b10101010,
                      NOTHING  = 0b11111111,
                      POINT    = 0b11110111;
 
+static const uint8_t BUTTON_PIN = PD5;
+
 typedef enum
 {
     PLUS  = (1 << 0),
@@ -72,9 +83,8 @@ static void printOnDisplay(uint8_t segmentData);
 static void printOn();
 static void printOff();
 
-static void allSegmentsOff();
-
 static uint8_t drawingSegmentData[4] = {NOTHING, NOTHING, NOTHING, NOTHING};
+static uint8_t buttonsState = 0xFF;
 
 int main(void)
 {
@@ -88,7 +98,6 @@ int main(void)
     {
         _delay_ms(10);
         drawTime(time, NO_BLINK);
-        OCR0A++;
     }
 }
 
@@ -96,6 +105,7 @@ static void initHardware(void)
 {
     DDRB = 0xFF;
     DDRD |= ALL_SEGMENTS;
+    PORTD |= (1 << BUTTON_PIN);
 }
 
 void timers_init(void)
@@ -125,7 +135,7 @@ static void drawTime(Time time, BlinkMode blink)
 
     drawingSegmentData[1] = DIGIT_SCHEMES[time.hrs  % 10];
     drawingSegmentData[2] = DIGIT_SCHEMES[time.mins / 10];
-    drawingSegmentData[3] = DIGIT_SCHEMES[time.mins % 10];
+    drawingSegmentData[3] = DIGIT_SCHEMES[buttonsState];
 }
 
 ISR(TIMER1_OVF_vect)
@@ -157,6 +167,32 @@ static uint16_t buttonOvfCounter = 0;
 
 ISR(TIMER0_OVF_vect)
 {
+    currentDigit = (currentDigit + 1) % 5;
+
+    if(currentDigit == 4) // Read buttons state
+    {
+        PORTB = NOTHING;
+        buttonsState = 0x00;
+
+        PORTD |= (SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
+        PORTD ^= SEGMENT_PINS[0];
+
+        _delay_us(10);
+        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN);
+
+        PORTD ^= SEGMENT_PINS[0] | SEGMENT_PINS[1];
+        _delay_us(10);
+        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN - 1);
+
+        PORTD ^= SEGMENT_PINS[1] | SEGMENT_PINS[2];
+        _delay_us(10);
+        buttonsState |= (PIND & (1 << BUTTON_PIN)) >> (BUTTON_PIN - 2);
+
+        PORTD ^= SEGMENT_PINS[2];
+
+        buttonsState ^= 0b111;
+        return;
+    }
     buttonOvfCounter++;
 	PORTD |= SEGMENT_PINS[currentDigit];
     PORTB = drawingSegmentData[currentDigit];
@@ -164,8 +200,7 @@ ISR(TIMER0_OVF_vect)
 
 ISR(TIMER0_COMPA_vect)
 {
-    allSegmentsOff();
-    currentDigit = (currentDigit + 1) % 4;
+	PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
 }
 
 static void printOn()
@@ -184,26 +219,6 @@ static void printOff()
     drawingSegmentData[3] = NOTHING;
 }
 
-/* static uint8_t readButtons() */
-/* { */
-/*     PORTB = NOTHING; */
-
-/*     uint8_t buttons = 0; */
-/*     for(int i = 0; i < 3; i++) */
-/*     { */
-/*         PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]); */
-/*         _delay_us(10); */
-/*         PORTB = segmentData; */
-/*         PORTD |=  SEGMENT_PINS[currentDigit]; */
-/*         PORTD = SEGMENT_PINS[i]; */
-
-/*     } */
-
-/*     PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]); */
-/*     return buttons; */
-/* } */
-
 static void allSegmentsOff() {
-	PORTD &= ~(SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
 }
 
