@@ -2,6 +2,8 @@
 #include <util/delay.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
+#include <avr/eeprom.h>
+#include <string.h>
 #include <stdbool.h>
 
 typedef struct
@@ -14,6 +16,7 @@ typedef struct
 typedef enum 
 {
     NORMAL,
+    SAVE_SETTINGS,
     SET_ALARM,
     SET_HOURS,
     SET_MINS,
@@ -36,7 +39,10 @@ typedef struct
     uint8_t  alarmEnabled;
     Time     alarmTime;
     uint8_t  brightness;
+    uint16_t magic;
 } EEPROMsettings;
+
+static uint16_t MAGIC = 0xF00D;
 
 static EEPROMsettings settings;
 
@@ -65,6 +71,7 @@ static const uint8_t F_LETTER = 0b10101010,
                      POINT    = 0b11110111;
 
 static const uint8_t BUTTON_PIN = PD5;
+static const uint8_t BUZZER_PIN = PD0;
 
 static Time time;
 
@@ -72,18 +79,30 @@ static void initHardware();
 static void timersInit(void);
 
 static void drawTime(Time time, BlinkMode blink);
+static void drawNumber(uint8_t time);
 
 static void printOnDisplay(uint8_t segmentData);
 static void printOn();
 static void printOff();
 
+static void writeSettings();
+static void readSettings();
+static void setDefSettings();
+
 static void readButtons();
 static void processSlowButtons(uint8_t button);
 static void processFastButtons(uint8_t button);
 
+static uint8_t addHours(uint8_t hours);
+static uint8_t decHours(uint8_t hours);
+static uint8_t addMins(uint8_t mins);
+static uint8_t decMins(uint8_t mins);
+static uint8_t addBrightness(uint8_t hours);
+static uint8_t decBrightness(uint8_t hours);
+
 static uint8_t drawingSegmentData[4] = {NOTHING, NOTHING, NOTHING, NOTHING};
 static uint8_t buttonsState = 0xFF;
-static uint16_t buttonOvfCounter = 0;
+static uint16_t timer0OvfCounter = 0;
 
 static uint8_t mode = NORMAL;
 
@@ -92,7 +111,6 @@ static const uint16_t ovfPeriod = F_CPU / 64 / 256;
 static const uint16_t shortPressTime =    0.1f * ovfPeriod;
 static const uint16_t longPressTime =     3.0f * ovfPeriod;
 static const uint16_t setAlarmDelay =     1.0f * ovfPeriod;
-static const uint16_t blinkPointsPeriod = 1.0f * ovfPeriod;
 
 typedef enum
 {
@@ -110,14 +128,14 @@ static void readButtons()
 
     if (newButtonsState < oldButtonsState) // unpress button
     {
-        if (buttonOvfCounter > longPressTime)
+        if (timer0OvfCounter > longPressTime)
             processSlowButtons(button);
-        else if (buttonOvfCounter > shortPressTime)
+        else if (timer0OvfCounter > shortPressTime)
             processFastButtons(button);
     }
 
     if (button)
-        buttonOvfCounter = 0;
+        timer0OvfCounter = 0;
     oldButtonsState = newButtonsState;
 }
 
@@ -155,33 +173,41 @@ static void processFastButtons(uint8_t button)
     case SET_HOURS:
         switch (button)
         {
-        case PLUS:  time.hrs = (time.hrs + 1) % 24; break;
-        case MINUS: time.hrs = (time.hrs - 1) % 24; break;
-        case SET:   mode = SET_MINS;                break;
+        case PLUS:  time.hrs = addHours(time.hrs); break;
+        case MINUS: time.hrs = decHours(time.hrs); break;
+        case SET:   mode = SET_MINS;               break;
         }
         break;
     case SET_MINS:
         switch(button)
         {
-        case PLUS:  time.mins = (time.mins + 1) % 60; break;
-        case MINUS: time.mins = (time.mins - 1) % 60; break;
-        case SET:   mode = NORMAL;                    break;
+        case PLUS:  time.mins = addMins(time.mins); break;
+        case MINUS: time.mins = decMins(time.mins); break;
+        case SET:   mode = SAVE_SETTINGS;           break;
         }
         break;
     case SET_ALARM_HOURS:
         switch (button)
         {
-        case PLUS:  settings.alarmTime.hrs = (settings.alarmTime.hrs + 1) % 24; break;
-        case MINUS: settings.alarmTime.hrs = (settings.alarmTime.hrs - 1) % 24; break;
-        case SET:   mode = SET_ALARM_MINS;                                      break;
+        case PLUS:  settings.alarmTime.hrs = addHours(settings.alarmTime.hrs); break;
+        case MINUS: settings.alarmTime.hrs = decHours(settings.alarmTime.hrs); break;
+        case SET:   mode = SET_ALARM_MINS;                                     break;
         }
         break;
     case SET_ALARM_MINS:
         switch (button)
         {
-        case PLUS:  settings.alarmTime.mins = (settings.alarmTime.mins + 1) % 60; break;
-        case MINUS: settings.alarmTime.mins = (settings.alarmTime.mins - 1) % 60; break;
-        case SET:   mode = NORMAL;                                                break;
+        case PLUS:  settings.alarmTime.mins = addMins(settings.alarmTime.mins); break;
+        case MINUS: settings.alarmTime.mins = decMins(settings.alarmTime.mins); break;
+        case SET:   mode = SAVE_SETTINGS;                                        break;
+        }
+        break;
+    case SET_BRIGHTNESS:
+        switch (button)
+        {
+        case PLUS:  settings.brightness =  addBrightness(settings.brightness); break;
+        case MINUS: settings.brightness =  decBrightness(settings.brightness); break;
+        case SET:   mode = SAVE_SETTINGS;                                     break;
         }
         break;
     case ALARM_RINGING:
@@ -196,17 +222,22 @@ static void processFastButtons(uint8_t button)
 int main(void)
 {
     initHardware();
-     mode = SET_ALARM;
+    readSettings();
 
     while (true)
     {
+        if(settings.alarmEnabled && time.hrs == settings.alarmTime.hrs && time.mins == settings.alarmTime.mins && time.secs == 0)
+            mode = ALARM_RINGING;
+
         _delay_ms(10);
         readButtons();
         switch (mode)
         {
+        case SAVE_SETTINGS:
+            writeSettings();
+            mode = NORMAL;
+            //no break
         case ALARM_RINGING:
-            //beep(currentTechTime, &settings);
-            // no break
         case NORMAL:
         {
             drawTime(time, BLINK_DOT);
@@ -218,8 +249,8 @@ int main(void)
             else
                 printOff();
 
-            if (buttonOvfCounter > setAlarmDelay)
-                mode = NORMAL;
+            if (timer0OvfCounter > setAlarmDelay)
+                mode = SAVE_SETTINGS;
 
             break;
         case SET_HOURS:
@@ -234,6 +265,10 @@ int main(void)
         case SET_ALARM_MINS:
             drawTime(settings.alarmTime, BLINK_MIN);
             break;
+        case SET_BRIGHTNESS:
+            OCR0A = settings.brightness;
+            drawNumber(OCR0A);
+            break;
         }
     }
 }
@@ -243,6 +278,7 @@ static void initHardware(void)
     PORTD |= (1 << BUTTON_PIN);
     DDRB = 0xFF;
     DDRD |= ALL_SEGMENTS;
+    DDRD |= (1 << BUZZER_PIN);
 
     timersInit();
 }
@@ -255,12 +291,11 @@ void timersInit(void)
     TCCR1B = (1 << CS12) | (1 << CS10); // 1/1024
 
     TCCR0A = 0x00;
-    TCCR0B = (1 << CS01) | (1 << CS00); // 1/1024
+    TCCR0B = (1 << CS01) | (1 << CS00); // 1/64
 
     TIFR  |= (1 << TOV1)  | (1 << TOV0)  | (1 << OCF0A);
     TIMSK  = (1 << TOIE1) | (1 << TOIE0) | (1 << OCIE0A);
 
-    OCR0A = 100; // brightness
     TCNT1 = MEGA_TIMER_PODGON;
 
     sei();
@@ -268,7 +303,7 @@ void timersInit(void)
 
 static void drawTime(Time time, BlinkMode blink)
 {
-    if(blink == BLINK_HRS && buttonOvfCounter & (1 << 8)) {
+    if(blink == BLINK_HRS && timer0OvfCounter & (1 << 8)) {
         drawingSegmentData[0] = NOTHING;
         drawingSegmentData[1] = NOTHING;
     } else {
@@ -279,17 +314,30 @@ static void drawTime(Time time, BlinkMode blink)
 
         drawingSegmentData[1] = DIGIT_SCHEMES[time.hrs  % 10];
 
-        if(blink == BLINK_DOT && buttonOvfCounter & (1 << 9))
+        if(blink == BLINK_DOT && timer0OvfCounter & (1 << 9))
             drawingSegmentData[1] &= POINT;
     }
 
-    if(blink == BLINK_MIN && buttonOvfCounter & (1 << 8)) {
+    if(blink == BLINK_MIN && timer0OvfCounter & (1 << 8)) {
         drawingSegmentData[2] = NOTHING;
         drawingSegmentData[3] = NOTHING;
     } else {
         drawingSegmentData[2] = DIGIT_SCHEMES[time.mins / 10];
         drawingSegmentData[3] = DIGIT_SCHEMES[time.mins % 10];
     }
+}
+
+static void drawNumber(uint8_t number) {
+    drawingSegmentData[0] = NOTHING;
+    if(number >= 100)
+        drawingSegmentData[1] = DIGIT_SCHEMES[number / 100 % 10];
+    else
+        drawingSegmentData[1] = NOTHING;
+    if(number >= 10)
+        drawingSegmentData[2] = DIGIT_SCHEMES[number / 10 % 10];
+    else
+        drawingSegmentData[2] = NOTHING;
+    drawingSegmentData[3] = DIGIT_SCHEMES[number % 10];
 }
 
 ISR(TIMER1_OVF_vect)
@@ -321,7 +369,7 @@ static uint8_t currentDigit = 0;
 ISR(TIMER0_OVF_vect)
 {
     currentDigit = (currentDigit + 1) % 5;
-    buttonOvfCounter++;
+    timer0OvfCounter++;
 
     if(currentDigit == 4) // Read buttons state
     {
@@ -329,7 +377,8 @@ ISR(TIMER0_OVF_vect)
         buttonsState = 0x00;
         uint8_t lastPBState = PORTD | (SEGMENT_PINS[0] | SEGMENT_PINS[1] | SEGMENT_PINS[2] | SEGMENT_PINS[3]);
 
-        for(int button = 0; button < 3; button++) {
+        for(int button = 0; button < 3; button++)
+        {
             PORTD = lastPBState & ~SEGMENT_PINS[button];
             _delay_us(1);
             buttonsState <<= 1;
@@ -338,6 +387,12 @@ ISR(TIMER0_OVF_vect)
 
         return;
     }
+
+    if(mode == ALARM_RINGING && timer0OvfCounter & (1 << 7))
+        PORTD ^= (1 << BUZZER_PIN);
+    else
+        PORTD &= ~(1 << BUZZER_PIN);
+
 
 	PORTD |= SEGMENT_PINS[currentDigit];
     PORTB = drawingSegmentData[currentDigit];
@@ -362,5 +417,78 @@ static void printOff()
     drawingSegmentData[1] = F_LETTER;
     drawingSegmentData[2] = F_LETTER;
     drawingSegmentData[3] = NOTHING;
+}
+
+static uint8_t addHours(uint8_t hours)
+{
+    if(hours == 23)
+        return 0;
+    return hours + 1;
+}
+
+static uint8_t decHours(uint8_t hours)
+{
+    if(hours == 0)
+        return 23;
+    return hours - 1;
+}
+
+static uint8_t addMins(uint8_t mins)
+{
+    if(mins == 59)
+        return 0;
+    return mins + 1;
+}
+
+static uint8_t decMins(uint8_t mins)
+{
+    if(mins == 0)
+        return 59;
+    return mins - 1;
+}
+
+static uint8_t addBrightness(uint8_t brightness)
+{
+    if(brightness >= 250)
+        return brightness;
+    if(brightness >= 100)
+        return brightness + 10;
+    if(brightness >= 50)
+        return brightness + 5;
+    if(brightness >= 20)
+        return brightness + 2;
+    return brightness + 1;
+}
+
+static uint8_t decBrightness(uint8_t brightness)
+{
+    if(brightness >= 110)
+        return brightness - 10;
+    else if(brightness >= 55)
+        return brightness - 5;
+    else if(brightness >= 22)
+        return brightness - 2;
+    else if(brightness >= 1)
+        return brightness - 1;
+    return brightness;
+}
+
+static void readSettings() {
+    eeprom_read_block(&settings, 0, sizeof(settings));
+    if(settings.magic != MAGIC)
+        setDefSettings();
+    OCR0A = settings.brightness;
+}
+
+static void writeSettings() {
+    eeprom_write_block(&settings, 0, sizeof(settings));
+}
+
+static void setDefSettings() {
+    settings.alarmEnabled = false;
+    settings.alarmTime.hrs  = 8;
+    settings.alarmTime.mins = 0;
+    settings.brightness = 100;
+    settings.magic = MAGIC;
 }
 
